@@ -208,6 +208,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
 
         while highest_ts >= ts_start and not iter_end:
             request_ts = highest_ts
+            data_ok = True
             log.info('timestamp: %s', request_ts)
             # rct power device seems to treat local time at GMT when converting from/to timestamps
             sock.send(make_frame(command=Command.WRITE, id=oid.object_id,
@@ -216,6 +217,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
             rframe = ReceiveFrame()
             while True:
                 try:
+                    data_ok = False
                     rread, _, _ = select.select([sock], [], [], 2)
                 except select.error as exc:
                     log.error('Select error: %s', str(exc))
@@ -236,6 +238,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
                             log.debug('Invalid command')
                             break
                         if rframe.complete():
+                            data_ok = True
                             break
                     else:
                         log.error('Device closed connection')
@@ -246,11 +249,13 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
 
             if not rframe.complete() or not rframe.crc_ok:
                 log.debug('Incomplete frame, retrying')
+                data_ok = False
                 continue
 
             # in case something (such as a "net.package") slips in, make sure to ignore all irelevant responses
             if rframe.id != oid.object_id:
                 log.debug('Got unexpected frame oid 0x%08X', rframe.id)
+                data_ok = False
                 continue
 
             try:
@@ -258,6 +263,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
             except (AssertionError, struct.error):
                 # the device sent invalid data with the correct CRC
                 log.debug('Invalid data received, retrying')
+                data_ok = False
                 continue
 
             # work with the data
@@ -303,7 +309,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
                     iter_end = True
 
                 # if the request timestamp is the same as the highest timestamp, we've reached the end of the data
-                if request_ts == highest_ts:
+                if request_ts == highest_ts and data_ok:
                     log.info('No new data received, stopping')
                     iter_end = True
 
