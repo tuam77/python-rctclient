@@ -207,7 +207,8 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
         highest_ts = ts_end
 
         while highest_ts >= ts_start and not iter_end:
-            log.info('timestamp: %s', highest_ts)
+            request_ts = highest_ts
+            log.info('timestamp: %s', request_ts)
             # rct power device seems to treat local time at GMT when converting from/to timestamps
             sock.send(make_frame(command=Command.WRITE, id=oid.object_id,
                                  payload=encode_value(DataType.INT32, int(highest_ts.replace(tzinfo=gmt).timestamp()))))
@@ -299,6 +300,11 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
 
                 # year statistics stop at 2000-01-02 00:59:59, so if the year hits 2000 we know we're done
                 if resolution == 'year' and t_ts.year == 2000:
+                    iter_end = True
+
+                # if the request timestamp is the same as the highest timestamp, we've reached the end of the data
+                if request_ts == highest_ts:
+                    log.info('No new data received, stopping')
                     iter_end = True
 
     if output is None:
