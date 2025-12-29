@@ -8,18 +8,19 @@ Retrieves time series data from the device and converts it to CSV.
 # SPDX-License-Identifier: GPL-3.0-only
 
 import csv
+import logging
 import os
 import select
 import socket
 import struct
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from tempfile import mkstemp
 from typing import Dict, Optional
 
 import click
-import pytz
 from dateutil.relativedelta import relativedelta
+from dateutil import tz
 
 from rctclient.exceptions import FrameCRCMismatch, FrameLengthExceeded, InvalidCommand
 from rctclient.frame import ReceiveFrame, make_frame
@@ -29,27 +30,17 @@ from rctclient.utils import decode_value, encode_value
 
 # pylint: disable=too-many-arguments,too-many-locals
 
-gmt = pytz.timezone('GMT')
+log = logging.getLogger('rctclient.timeseries2csv')
+gmt = tz.gettz('GMT')
 
 def datetime_range(start: datetime, end: datetime, delta: relativedelta):
     '''
     Generator yielding datetime objects between `start` and `end` with `delta` increments.
     '''
     current = start
-    while current < end:
+    while current <= end:
         yield current
         current += delta
-
-
-be_quiet: bool = False
-
-
-def cprint(text: str) -> None:
-    '''
-    Custom print to output to stderr if quiet is not set.
-    '''
-    if not be_quiet:
-        click.echo(text, err=True)
 
 
 @click.command()
@@ -61,14 +52,16 @@ def cprint(text: str) -> None:
               default='simple', help='Header format [simple]')
 @click.option('--time-zone', type=str, default='Europe/Berlin', help='Timezone of the device (not the host running the'
                                                                      ' script) [Europe/Berlin].')
-@click.option('-q', '--quiet', type=bool, is_flag=True, default=False, help='Supress output.')
+@click.option('-q', '--quiet', is_flag=True, default=False, help='Suppress output (sets log level to ERROR).')
+@click.option('--loglevel', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
+              default='INFO', help='Set the logging level [INFO].')
 @click.option('-r', '--resolution', type=click.Choice(['minutes', 'day', 'month', 'year'], case_sensitive=False),
               default='day', help='Resolution to query [minutes].')
 @click.option('-c', '--count', type=int, default=1, help='Amount of time to go back, depends on --resolution, see '
               '--help.')
 @click.argument('DAY_BEFORE_TODAY', type=int)
-def timeseries2csv(host: str, port: int, output: Optional[str], header_format: bool, time_zone: str, quiet: bool,
-                   resolution: str, count: int, day_before_today: int) -> None:
+def timeseries2csv(host: str, port: int, output: Optional[str], header_format: str, time_zone: str, quiet: bool,
+                   loglevel: str, resolution: str, count: int, day_before_today: int) -> None:
 
     '''
     Extract time series data from an RCT device. The tool works similar to the official App, but can be run
@@ -107,14 +100,19 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
 
     * 4 Months back, at 1 month resolution: --resolution=month --count=4 0
     '''
-    global be_quiet
-    be_quiet = quiet
+    # Configure logging
+    log_level = logging.ERROR if quiet else getattr(logging, loglevel.upper())
+    logging.basicConfig(
+        level=log_level,
+        format='%(levelname)s - %(message)s',
+        stream=sys.stderr
+    )
 
     if count < 1:
-        cprint('Error: --count must be a positive integer')
+        log.error('Error: --count must be a positive integer')
         sys.exit(1)
 
-    timezone = pytz.timezone(time_zone)
+    timezone = tz.gettz(time_zone)
     now = datetime.now(timezone)
 
     if resolution == 'minutes':
@@ -133,11 +131,11 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
         # select whole days when not querying the current day
         if day_before_today > 0:
             # lowest timestamp that's of interest
-            ts_start = (now - timedelta(days=day_before_today)).replace(hour=0, minute=0, second=0, microsecond=0)
+            ts_start = (now - timedelta(days=day_before_today + count - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
             # highest timestamp, we stop when this is reached
-            ts_end = ts_start.replace(hour=23, minute=59, second=59, microsecond=0)
+            ts_end = (now - timedelta(days=day_before_today)).replace(hour=23, minute=59, second=59, microsecond=0)
         else:
-            ts_start = ((now - (now - datetime.min) % timedelta(minutes=30)) - timedelta(hours=count)) \
+            ts_start = ((now - (now - datetime.min.astimezone(timezone.utc)) % timedelta(minutes=30)) - timedelta(hours=count)) \
                 .replace(second=0, microsecond=0)
             ts_end = now.replace(second=59, microsecond=0)
 
@@ -149,8 +147,8 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
         # one sample every day
         timediff = relativedelta(days=1)
         # <count> days
-        ts_start = (now - timedelta(days=day_before_today + count)) \
-            .replace(hour=0, minute=59, second=59, microsecond=0)
+        ts_start = (now - timedelta(days=day_before_today + count - 1)) \
+            .replace(hour=23, minute=59, second=59, microsecond=0)
         ts_end = (now - timedelta(days=day_before_today)).replace(hour=23, minute=59, second=59, microsecond=0)
     elif resolution == 'month':
         oid_names = ['logger.month_ea_log_ts', 'logger.month_eac_log_ts', 'logger.month_eb_log_ts',
@@ -160,11 +158,11 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
         # one sample per month
         timediff = relativedelta(months=1)
         # <count> months
-        ts_start = (now - timedelta(days=day_before_today) - relativedelta(months=count)) \
-            .replace(day=2, hour=0, minute=59, second=59, microsecond=0)
+        ts_start = (now - timedelta(days=day_before_today) - relativedelta(months=count - 1)) \
+            .replace(day=1, hour=23, minute=59, second=59, microsecond=0)
         if ts_start.year < 2000:
             ts_start = ts_start.replace(year=2000)
-        ts_end = (now - timedelta(days=day_before_today)).replace(day=2, hour=23, minute=59, second=59, microsecond=0)
+        ts_end = (now - timedelta(days=day_before_today)).replace(day=1, hour=23, minute=59, second=59, microsecond=0)
     elif resolution == 'year':
         oid_names = ['logger.year_ea_log_ts', 'logger.year_eac_log_ts', 'logger.year_eb_log_ts',
                      'logger.year_eext_log_ts', 'logger.year_egrid_feed_log_ts', 'logger.year_egrid_load_log_ts',
@@ -173,19 +171,19 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
         # one sample per year
         timediff = relativedelta(years=1)
         # <count> years
-        ts_start = (now - timedelta(days=day_before_today) - relativedelta(years=count)) \
-            .replace(month=1, day=2, hour=0, minute=59, second=59, microsecond=0)
+        ts_start = (now - timedelta(days=day_before_today) - relativedelta(years=count - 1)) \
+            .replace(month=1, day=1, hour=23, minute=59, second=59, microsecond=0)
         ts_end = (now - timedelta(days=day_before_today)) \
-            .replace(month=1, day=2, hour=23, minute=59, second=59, microsecond=0)
+            .replace(month=1, day=1, hour=23, minute=59, second=59, microsecond=0)
     else:
-        cprint('Unsupported resolution')
+        log.error('Unsupported resolution')
         sys.exit(1)
 
     if day_before_today < 0:
-        cprint('DAYS_BEFORE_TODAY must be a positive number')
+        log.error('DAYS_BEFORE_TODAY must be a positive number')
         sys.exit(1)
     if day_before_today > 365:
-        cprint('DAYS_BEFORE_TODAY must be less than a year ago')
+        log.error('DAYS_BEFORE_TODAY must be less than a year ago')
         sys.exit(1)
 
     oids = [x for x in R.all() if x.name in oid_names]
@@ -194,21 +192,22 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
     try:
         sock.connect((host, port))
     except ConnectionRefusedError:
-        cprint('Device refused connection')
+        log.error('Device refused connection')
         sys.exit(2)
 
+    log.info('Requesting from %s to %s', ts_start, ts_end)
     datetable: Dict[datetime, Dict[str, int]] = {dt: dict() for dt in datetime_range(ts_start, ts_end, timediff)}
 
     for oid in oids:
         name = oid.name.replace(name_prefix, '').replace('_log_ts', '')
-        cprint(f'Requesting {name}')
+        log.info('Requesting %s', name)
 
         # set to true if the current time series reached its end, e.g. year 2000 for "year" resolution
         iter_end = False
         highest_ts = ts_end
 
-        while highest_ts > ts_start and not iter_end:
-            cprint(f'\ttimestamp: {highest_ts}')
+        while highest_ts >= ts_start and not iter_end:
+            log.info('timestamp: %s', highest_ts)
             # rct power device seems to treat local time at GMT when converting from/to timestamps
             sock.send(make_frame(command=Command.WRITE, id=oid.object_id,
                                  payload=encode_value(DataType.INT32, int(highest_ts.replace(tzinfo=gmt).timestamp()))))
@@ -218,7 +217,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
                 try:
                     rread, _, _ = select.select([sock], [], [], 2)
                 except select.error as exc:
-                    cprint(f'Select error: {str(exc)}')
+                    log.error('Select error: %s', str(exc))
                     raise
 
                 if rread:
@@ -227,44 +226,45 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
                         try:
                             rframe.consume(buf)
                         except FrameCRCMismatch:
-                            cprint('\tCRC error')
+                            log.debug('CRC error')
                             break
                         except FrameLengthExceeded:
-                            cprint('\tFrame length exceeded')
+                            log.debug('Frame length exceeded')
                             break
                         except InvalidCommand:
-                            cprint('\tInvalid command')
+                            log.debug('Invalid command')
                             break
                         if rframe.complete():
                             break
                     else:
-                        cprint('Device closed connection')
+                        log.error('Device closed connection')
                         sys.exit(2)
                 else:
-                    cprint('\tTimeout, retrying')
+                    log.debug('Timeout, retrying')
                     break
 
             if not rframe.complete() or not rframe.crc_ok:
-                cprint('\tIncomplete frame, retrying')
+                log.debug('Incomplete frame, retrying')
                 continue
 
             # in case something (such as a "net.package") slips in, make sure to ignore all irelevant responses
             if rframe.id != oid.object_id:
-                cprint(f'\tGot unexpected frame oid 0x{rframe.id:08X}')
+                log.debug('Got unexpected frame oid 0x%08X', rframe.id)
                 continue
 
             try:
                 _, table = decode_value(DataType.TIMESERIES, rframe.data)
             except (AssertionError, struct.error):
                 # the device sent invalid data with the correct CRC
-                cprint('\tInvalid data received, retrying')
+                log.debug('Invalid data received, retrying')
                 continue
 
             # work with the data
             for t_ts, t_val in table.items():
 
                 # rct power device seems to treat local time at GMT when converting from/to timestamps
-                t_ts = timezone.localize(t_ts)
+                t_ts = t_ts.replace(tzinfo=timezone)
+                log.debug('Received %s', t_ts)
 
                 # set the "highest" point in time to know what to request next when the day is not complete
                 if t_ts < highest_ts:
@@ -272,7 +272,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
 
                 # break if we reached the end of the day
                 if t_ts < ts_start:
-                    cprint('\tReached limit')
+                    log.info('Reached limit')
                     break
 
                 # Check if the timestamp fits the raster, adjust depending on the resolution
@@ -281,18 +281,18 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
                         # correct up to one full minute
                         nt_ts = t_ts.replace(second=0)
                         if nt_ts not in datetable:
-                            nt_ts = t_ts.replace(second=0, minute=(t_ts.minute + 1) % 60, hour=t_ts.hour + (t_ts.minute + 1) // 60)
+                            nt_ts = t_ts.replace(second=0) + timedelta(minute=1)
                             if nt_ts not in datetable:
-                                cprint(f'\t{t_ts} does not fit raster, skipped')
+                                log.warning('%s does not fit raster, skipped', t_ts)
                                 continue
                         t_ts = nt_ts
                     elif resolution in ['day', 'month']:
                         # correct up to one hour
                         nt_ts = t_ts.replace(hour=0)
                         if nt_ts not in datetable:
-                            nt_ts = t_ts.replace(hour=t_ts.hour + 1)
+                            nt_ts = t_ts + timedelta(hours=1)
                             if nt_ts not in datetable:
-                                cprint(f'\t{t_ts} does not fit raster, skipped')
+                                log.warning('%s does not fit raster, skipped', t_ts)
                                 continue
                         t_ts = nt_ts
                 datetable[t_ts][name] = t_val
@@ -332,11 +332,11 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: b
         try:
             os.rename(filepath, output)
         except OSError as exc:
-            cprint(f'Could not move destination file: {str(exc)}')
+            log.error('Could not move destination file: %s', str(exc))
             try:
                 os.unlink(filepath)
             except Exception:
-                cprint(f'Could not remove temporary file {filepath}')
+                log.error('Could not remove temporary file %s', filepath)
             sys.exit(1)
 
 

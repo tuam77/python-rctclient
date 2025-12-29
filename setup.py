@@ -33,6 +33,7 @@ setup(
     extras_require={
         'cli': [
             'click >=7.0, <8.2',
+            'python-dateutil',
         ],
         'tests': [
             'mypy',
