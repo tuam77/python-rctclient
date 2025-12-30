@@ -53,7 +53,7 @@ def datetime_range(start: datetime, end: datetime, delta: relativedelta):
 @click.option('--time-zone', type=str, default='Europe/Berlin', help='Timezone of the device (not the host running the'
                                                                      ' script) [Europe/Berlin].')
 @click.option('-q', '--quiet', is_flag=True, default=False, help='Suppress output (sets log level to ERROR).')
-@click.option('--loglevel', type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
+@click.option('--loglevel', type=click.Choice(['DEBUG', 'VERBOSE', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
               default='INFO', help='Set the logging level [INFO].')
 @click.option('-r', '--resolution', type=click.Choice(['minutes', 'day', 'month', 'year'], case_sensitive=False),
               default='day', help='Resolution to query [minutes].')
@@ -101,6 +101,8 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
     * 4 Months back, at 1 month resolution: --resolution=month --count=4 0
     '''
     # Configure logging
+    logging.addLevelName('VERBOSE', 15)
+    logging.VERBOSE = 15
     log_level = logging.ERROR if quiet else getattr(logging, loglevel.upper())
     logging.basicConfig(
         level=log_level,
@@ -205,8 +207,9 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
         # set to true if the current time series reached its end, e.g. year 2000 for "year" resolution
         iter_end = False
         highest_ts = ts_end
+        no_more_data = 0
 
-        while highest_ts >= ts_start and not iter_end:
+        while highest_ts >= ts_start and not iter_end and no_more_data < 10:
             request_ts = highest_ts
             data_ok = True
             log.info('timestamp: %s', request_ts)
@@ -219,42 +222,45 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
                 try:
                     data_ok = False
                     rread, _, _ = select.select([sock], [], [], 2)
+                    log.log(logging.VERBOSE, 'Select returned %s', rread)
                 except select.error as exc:
                     log.error('Select error: %s', str(exc))
                     raise
 
                 if rread:
                     buf = sock.recv(1024)
+                    log.log(logging.VERBOSE, 'Received %d bytes', len(buf))
                     if len(buf) > 0:
                         try:
                             rframe.consume(buf)
                         except FrameCRCMismatch:
-                            log.debug('CRC error')
+                            log.log(logging.VERBOSE, 'CRC error')
                             break
                         except FrameLengthExceeded:
-                            log.debug('Frame length exceeded')
+                            log.log(logging.VERBOSE, 'Frame length exceeded')
                             break
                         except InvalidCommand:
-                            log.debug('Invalid command')
+                            log.log(logging.VERBOSE, 'Invalid command')
                             break
                         if rframe.complete():
                             data_ok = True
+                            log.log(logging.VERBOSE, 'Frame complete')
                             break
                     else:
                         log.error('Device closed connection')
                         sys.exit(2)
                 else:
-                    log.debug('Timeout, retrying')
+                    log.log(logging.VERBOSE, 'Timeout, retrying')
                     break
 
             if not rframe.complete() or not rframe.crc_ok:
-                log.debug('Incomplete frame, retrying')
+                log.log(logging.VERBOSE, 'Incomplete frame, retrying')
                 data_ok = False
                 continue
 
             # in case something (such as a "net.package") slips in, make sure to ignore all irelevant responses
             if rframe.id != oid.object_id:
-                log.debug('Got unexpected frame oid 0x%08X', rframe.id)
+                log.log(logging.VERBOSE, 'Got unexpected frame oid 0x%08X', rframe.id)
                 data_ok = False
                 continue
 
@@ -262,7 +268,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
                 _, table = decode_value(DataType.TIMESERIES, rframe.data)
             except (AssertionError, struct.error):
                 # the device sent invalid data with the correct CRC
-                log.debug('Invalid data received, retrying')
+                log.log(logging.VERBOSE, 'Invalid data received, retrying')
                 data_ok = False
                 continue
 
@@ -271,7 +277,7 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
 
                 # rct power device seems to treat local time at GMT when converting from/to timestamps
                 t_ts = t_ts.replace(tzinfo=timezone)
-                log.debug('Received %s', t_ts)
+                log.log(logging.VERBOSE, 'Received %s', t_ts)
 
                 # set the "highest" point in time to know what to request next when the day is not complete
                 if t_ts < highest_ts:
@@ -308,10 +314,15 @@ def timeseries2csv(host: str, port: int, output: Optional[str], header_format: s
                 if resolution == 'year' and t_ts.year == 2000:
                     iter_end = True
 
-                # if the request timestamp is the same as the highest timestamp, we've reached the end of the data
-                if request_ts == highest_ts and data_ok:
+            # if the request timestamp is the same as the highest timestamp, we've reached the end of the data
+            if request_ts == highest_ts and data_ok:
+                no_more_data += 1
+                if no_more_data >= 10:
                     log.info('No new data received, stopping')
-                    iter_end = True
+                else:
+                    log.log(logging.VERBOSE, 'No new data received (times: %d), retrying', no_more_data)
+            else:
+                no_more_data = 0
 
     if output is None:
         output = f'data_{resolution}_{ts_start.isoformat("T")}.csv'
